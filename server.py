@@ -91,6 +91,7 @@ ENV_VARS = [
     ("BROWSERBASE_API_KEY",      "Browserbase key",          "tool",      True),
     ("BROWSERBASE_PROJECT_ID",   "Browserbase project",      "tool",      False),
     ("GITHUB_TOKEN",             "GitHub token",             "tool",      True),
+    ("GH_TOKEN",                 "GitHub token (gh)",        "tool",      True),
     ("VOICE_TOOLS_OPENAI_KEY",   "OpenAI (voice/TTS)",       "tool",      True),
     ("HONCHO_API_KEY",           "Honcho (memory)",          "tool",      True),
     ("TELEGRAM_BOT_TOKEN",       "Bot Token",                "telegram",  True),
@@ -402,6 +403,69 @@ async def logout(request: Request) -> Response:
     return resp
 
 
+# ── Child process env helpers ───────────────────────────────────────────────────
+CHILD_ENV_ALLOWLIST = {
+    "PATH", "HOME", "LANG", "LC_ALL", "TERM",
+    "TMPDIR", "TMP", "TEMP", "PYTHONPATH",
+    "PYTHONUNBUFFERED", "PYTHONIOENCODING",
+    "HERMES_HOME",
+}
+
+# Runtime/tool auth tokens that must propagate from Railway into Hermes child processes.
+TOKEN_ENV_KEYS = ("GITHUB_TOKEN", "GH_TOKEN")
+
+
+def build_child_env(file_env: dict[str, str] | None = None) -> dict[str, str]:
+    """Build a minimal child-process env with explicit token propagation.
+
+    Railway injects secrets into this process env. We pass through only a narrow
+    runtime whitelist plus known Hermes config keys, then overlay ~/.hermes/.env.
+    """
+    child_env: dict[str, str] = {}
+
+    # Base runtime essentials so subprocesses can execute normally.
+    for key in CHILD_ENV_ALLOWLIST:
+        value = os.environ.get(key)
+        if value is not None:
+            child_env[key] = value
+
+    # Hermes config/tool vars managed by the setup UI (and optionally set by Railway).
+    for key, *_ in ENV_VARS:
+        value = os.environ.get(key)
+        if value is not None:
+            child_env[key] = value
+
+    # Explicitly include both GitHub token names for tool auth compatibility.
+    for key in TOKEN_ENV_KEYS:
+        value = os.environ.get(key)
+        if value is not None:
+            child_env[key] = value
+
+    child_env["HERMES_HOME"] = HERMES_HOME
+
+    # ~/.hermes/.env should override process env for managed config.
+    if file_env:
+        for key, value in file_env.items():
+            child_env[key] = value
+
+    return child_env
+
+
+def token_presence_diagnostic(env: dict[str, str]) -> dict[str, bool]:
+    """Safe auth diagnostic: report token presence only, never values."""
+    return {key: bool(env.get(key)) for key in TOKEN_ENV_KEYS}
+
+
+def log_token_presence(prefix: str, env: dict[str, str]) -> None:
+    status = token_presence_diagnostic(env)
+    print(
+        f"[{prefix}] token env presence: "
+        f"GITHUB_TOKEN={'present' if status['GITHUB_TOKEN'] else 'missing'} "
+        f"GH_TOKEN={'present' if status['GH_TOKEN'] else 'missing'}",
+        flush=True,
+    )
+
+
 # ── Gateway manager ───────────────────────────────────────────────────────────
 class Gateway:
     def __init__(self):
@@ -417,13 +481,14 @@ class Gateway:
         self.state = "starting"
         try:
             # .env values take priority over Railway env vars.
-            # We build the env this way so hermes's own dotenv loading
-            # (which reads the same file) doesn't shadow our values.
-            env = {**os.environ, "HERMES_HOME": HERMES_HOME}
-            env.update(read_env(ENV_FILE))
+            # We build a narrow env whitelist so child runtimes only receive
+            # required runtime/config vars (including GitHub auth tokens).
+            file_env = read_env(ENV_FILE)
+            env = build_child_env(file_env)
             model = env.get("LLM_MODEL", "")
             provider_key = next((env.get(k, "") for k in PROVIDER_KEYS if env.get(k)), "")
             print(f"[gateway] model={model or '⚠ NOT SET'} | provider_key={'set' if provider_key else '⚠ NOT SET'}", flush=True)
+            log_token_presence('gateway', env)
             # Write config.yaml so hermes picks up the model (env vars alone aren't always enough)
             write_config_yaml(read_env(ENV_FILE))
             self.proc = await asyncio.create_subprocess_exec(
@@ -504,6 +569,8 @@ class Dashboard:
         if self.proc and self.proc.returncode is None:
             return
         try:
+            env = build_child_env(read_env(ENV_FILE))
+            log_token_presence('dashboard', env)
             self.proc = await asyncio.create_subprocess_exec(
                 "hermes", "dashboard",
                 "--host", HERMES_DASHBOARD_HOST,
@@ -511,6 +578,7 @@ class Dashboard:
                 "--no-open",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                env=env,
             )
             print(f"[dashboard] spawned pid={self.proc.pid} → {HERMES_DASHBOARD_URL}", flush=True)
             self._drain_task = asyncio.create_task(self._drain())
